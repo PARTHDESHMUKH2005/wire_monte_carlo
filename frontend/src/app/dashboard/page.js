@@ -7,6 +7,8 @@ import {
   ResponsiveContainer,
 } from "recharts";
 
+const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
 export default function Dashboard() {
   const router = useRouter();
   const [userName, setUserName] = useState("");
@@ -78,7 +80,7 @@ export default function Dashboard() {
     if (t.length !== w.length) { setError("Tickers and weights count must match"); setLoading(false); return; }
     if (Math.abs(w.reduce((a, b) => a + b, 0) - 1) > 0.01) { setError("Weights must sum to 1.0"); setLoading(false); return; }
     try {
-      const res = await fetch("http://localhost:8000/analyze", {
+      const res = await fetch(`${API}/analyze`, {
         method: "POST", headers: authHeaders(),
         body: JSON.stringify({ tickers: t, weights: w }),
       });
@@ -110,7 +112,7 @@ export default function Dashboard() {
         backtest_grade: backtestData?.accuracy?.grade || "",
         backtest_verdict: backtestData?.accuracy?.verdict || "",
       };
-      const res = await fetch("http://localhost:8000/summary", {
+      const res = await fetch(`${API}/summary`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
@@ -136,7 +138,7 @@ export default function Dashboard() {
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 120000);
-      const res = await fetch("http://localhost:8000/backtest", {
+      const res = await fetch(`${API}/backtest`, {
         method: "POST", headers: authHeaders(),
         body: JSON.stringify({ tickers: t, weights: w }),
         signal: controller.signal,

@@ -3,6 +3,8 @@
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 
+const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
 export default function HistoryPage() {
   const router = useRouter();
   const [history, setHistory] = useState([]);
@@ -26,7 +28,7 @@ export default function HistoryPage() {
     setError(null);
     try {
       const token = localStorage.getItem("liverisk_token");
-      const res = await fetch("http://localhost:8000/history", {
+      const res = await fetch(`${API}/history`, {
         headers: { "Authorization": `Bearer ${token}` },
       });
       if (res.status === 401) {
