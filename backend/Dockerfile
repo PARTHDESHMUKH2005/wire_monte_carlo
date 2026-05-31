@@ -8,12 +8,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
-COPY requirements-render.txt .
+COPY requirements.txt .
 
 RUN pip install --no-cache-dir --prefer-binary --default-timeout=300 \
     numpy==1.26.4 pandas==2.2.2
 
-RUN pip install --no-cache-dir --prefer-binary --default-timeout=300 -r requirements-render.txt
+RUN pip install --no-cache-dir --prefer-binary --default-timeout=300 -r requirements.txt
 
 COPY . .
 

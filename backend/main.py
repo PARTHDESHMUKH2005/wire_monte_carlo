@@ -1,7 +1,12 @@
+import os, sys, pickle, json, sqlite3
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ["GRPC_PYTHON_BUILD_SYSTEM_OPENSSL"] = "1"
+os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
-import os, sys, pickle, json, sqlite3
 from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -57,6 +62,11 @@ def init_db():
     conn.close()
 
 init_db()
+
+_sentiment_pipeline = None
+_sentiment_pipeline_loaded = False
+_wire_client = None
+_lstm_cache = {}
 
 app = FastAPI(title="LiveRisk API", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -120,6 +130,34 @@ def login(req: LoginRequest):
         raise HTTPException(status_code=401, detail="Invalid password")
     token = create_token(req.name)
     return {"token": token, "name": req.name, "password_hint": SHARED_PASSWORD}
+
+def _get_wire_client():
+    global _wire_client
+    if _wire_client is None and WIRE_API_KEY:
+        try:
+            from anakin import Anakin
+            _wire_client = Anakin(api_key=WIRE_API_KEY)
+        except Exception:
+            _wire_client = None
+    return _wire_client
+
+def wire_call(action_id: str, params: dict):
+    client = _get_wire_client()
+    if client is None:
+        return None
+    try:
+        result = client.wire(action_id, params)
+        if result is not None:
+            if hasattr(result, 'model_dump'):
+                return result.model_dump()
+            if hasattr(result, 'dict'):
+                return result.dict()
+            if isinstance(result, dict):
+                return result
+        return None
+    except Exception as e:
+        print(f"  Wire '{action_id}' failed: {e}")
+        return None
 
 def _synthetic_prices(tickers, years=2):
     rng = np.random.default_rng(42)
@@ -208,16 +246,14 @@ def risk_metrics(terminal, seed_capital, confidence=0.95):
 def sentiment_analysis(tickers):
     headlines = []
 
-    try:
-        from anakin import Anakin
-        client = Anakin(api_key=WIRE_API_KEY)
-        search = client.search(f"latest news for {' '.join(tickers)} stock market 2026", limit=10)
-        if search.results:
-            for r in search.results:
-                if r.snippet:
-                    headlines.append({"title": r.title or "", "snippet": r.snippet})
-    except Exception:
-        pass
+    for t in tickers:
+        data = wire_call("reuters", {"ticker": t, "action": "headlines", "limit": 10})
+        if data and 'headlines' in data:
+            for h in data['headlines']:
+                title = h.get('title', h.get('headline', ''))
+                snippet = h.get('snippet', h.get('summary', h.get('text', '')))
+                headlines.append({"title": title, "snippet": snippet})
+            print(f"  Wire reuters: {len(data['headlines'])} headlines for {t}")
 
     if not headlines:
         for t in tickers:
@@ -233,24 +269,41 @@ def sentiment_analysis(tickers):
                 pass
 
     if not headlines:
+        try:
+            client = _get_wire_client()
+            if client:
+                search = client.search(f"latest financial news for {' '.join(tickers)} stock market", limit=10)
+                if search and search.results:
+                    for r in search.results:
+                        if r.title or r.snippet:
+                            headlines.append({"title": r.title or "", "snippet": r.snippet or ""})
+        except Exception:
+            pass
+
+    if not headlines:
         return {"score": 0.0, "headlines": [], "summary": "No news data available"}
 
+    sentiment = 0.0
     try:
-        from transformers import pipeline
-        classifier = pipeline("sentiment-analysis", model="ProsusAI/finbert", device=-1)
-        texts = [h.get("title", "") + ". " + h.get("snippet", "") for h in headlines[:20]]
-        results = classifier(texts, truncation=True, max_length=512)
-        scores = []
-        for r in results:
-            label = r["label"]
-            score = r["score"]
-            if label.lower() == "positive":
-                scores.append(score)
-            elif label.lower() == "negative":
-                scores.append(-score)
-            else:
-                scores.append(0.0)
-        sentiment = round(float(np.mean(scores)), 4) if scores else 0.0
+        global _sentiment_pipeline, _sentiment_pipeline_loaded
+        if not _sentiment_pipeline_loaded:
+            from transformers import pipeline as _hf_pipeline
+            _sentiment_pipeline = _hf_pipeline("sentiment-analysis", model="ProsusAI/finbert", device=-1)
+            _sentiment_pipeline_loaded = True
+        if _sentiment_pipeline is not None:
+            texts = [h.get("title", "") + ". " + h.get("snippet", "") for h in headlines[:20]]
+            results = _sentiment_pipeline(texts, truncation=True, max_length=512)
+            scores = []
+            for r in results:
+                label = r["label"]
+                score = r["score"]
+                if label.lower() == "positive":
+                    scores.append(score)
+                elif label.lower() == "negative":
+                    scores.append(-score)
+                else:
+                    scores.append(0.0)
+            sentiment = round(float(np.mean(scores)), 4) if scores else 0.0
     except Exception:
         sentiment = 0.0
 
@@ -266,49 +319,60 @@ def sentiment_analysis(tickers):
 
 def reddit_hype(tickers):
     mentions = {}
-    try:
-        from anakin import Anakin
-        client = Anakin(api_key=WIRE_API_KEY)
-        search = client.search(f"wallstreetbets {' '.join(tickers)} stock mention count May 2026", limit=5)
-        if search.results:
-            mentions = {t: 5 for t in tickers}
-    except Exception:
-        pass
+    for t in tickers:
+        data = wire_call("reddit", {
+            "ticker": t,
+            "subreddit": "wallstreetbets",
+            "action": "mentions",
+            "time_filter": "week",
+            "limit": 25,
+        })
+        if data:
+            posts = data.get('posts', data.get('mentions', []))
+            if isinstance(posts, list):
+                mentions[t] = len(posts)
+            else:
+                count = data.get('mention_count', data.get('count', data.get('total_mentions', 0)))
+                mentions[t] = count if isinstance(count, (int, float)) else 0
+            print(f"  Wire reddit: {mentions[t]} WSB mentions for {t}")
+
+    if not mentions:
+        try:
+            client = _get_wire_client()
+            if client:
+                search = client.search(f"wallstreetbets {' '.join(tickers)} reddit mentions", limit=5)
+                if search and search.results:
+                    for t in tickers:
+                        mentions[t] = 3
+        except Exception:
+            pass
+
     spike = any(v > 10 for v in mentions.values()) if mentions else False
     return {"mentions": mentions, "spike_detected": spike}
 
-def lstm_forecast(prices, weights, forecast_days=60, seed_capital=1_000_000):
-    price_index = (prices * weights[:len(prices.columns)]).sum(axis=1)
-    scale = seed_capital / float(price_index.iloc[0])
-    portfolio_value = price_index * scale
-
-    try:
-        from sklearn.preprocessing import MinMaxScaler
-        from tensorflow.keras.models import Sequential
-        from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
-        from tensorflow.keras.callbacks import EarlyStopping
-        import os as _os
-        _os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-    except ImportError:
-        last = float(portfolio_value.iloc[-1])
-        drift = 0.0005
-        seq = [last * (1 + drift + np.random.normal(0, 0.01)) for _ in range(forecast_days)]
-        return {"forecast": [round(last, 2)] + [round(float(v), 2) for v in seq]}
-
-    returns = portfolio_value.pct_change().dropna().to_numpy(dtype=float).reshape(-1, 1)
-    scaler = MinMaxScaler()
-    scaled = scaler.fit_transform(returns)
+def _build_lstm_model(portfolio_value, forecast_days=60):
     seq_len = 60
+    returns = portfolio_value.pct_change().dropna().to_numpy(dtype=float).reshape(-1, 1)
+
+    if len(returns) < seq_len + 10:
+        return None, "Insufficient data for LSTM training"
+
+    from sklearn.preprocessing import MinMaxScaler
+    scaler = MinMaxScaler()
+    returns_scaled = scaler.fit_transform(returns)
+
     X, y = [], []
-    for i in range(seq_len, len(scaled)):
-        X.append(scaled[i - seq_len:i, 0])
-        y.append(scaled[i, 0])
+    for i in range(seq_len, len(returns_scaled)):
+        X.append(returns_scaled[i - seq_len:i, 0])
+        y.append(returns_scaled[i, 0])
+
     X = np.array(X).reshape(-1, seq_len, 1)
     y = np.array(y)
-    if len(X) < 100:
-        last = float(portfolio_value.iloc[-1])
-        seq = [last * (1 + 0.0005 + np.random.normal(0, 0.01)) for _ in range(forecast_days)]
-        return {"forecast": [round(last, 2)] + [round(float(v), 2) for v in seq]}
+
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
+    from tensorflow.keras.callbacks import EarlyStopping
+    from tensorflow.keras.optimizers import Adam
 
     model = Sequential([
         Input(shape=(seq_len, 1)),
@@ -316,27 +380,78 @@ def lstm_forecast(prices, weights, forecast_days=60, seed_capital=1_000_000):
         Dropout(0.2),
         LSTM(32, return_sequences=False),
         Dropout(0.2),
-        Dense(16, activation="relu"),
-        Dense(1),
+        Dense(16, activation='relu'),
+        Dense(1)
     ])
-    model.compile(optimizer="adam", loss="mse", metrics=["mae"])
-    split = int(len(X) * 0.8)
-    model.fit(X[:split], y[:split], validation_data=(X[split:], y[split:]),
-              epochs=30, batch_size=32, callbacks=[EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True)], verbose=0)
+    model.compile(optimizer=Adam(learning_rate=0.001), loss='mse', metrics=['mae'])
 
-    last_seq = scaled[-seq_len:].flatten().tolist()
-    preds = []
+    early_stop = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True, verbose=0)
+
+    split = int(len(X) * 0.8)
+    if split < seq_len:
+        split = max(seq_len, int(len(X) * 0.5))
+
+    X_train, X_test = X[:split], X[split:]
+    y_train, y_test = y[:split], y[split:]
+
+    model.fit(
+        X_train, y_train,
+        validation_data=(X_test, y_test),
+        epochs=50,
+        batch_size=32,
+        callbacks=[early_stop],
+        verbose=0
+    )
+
+    last_sequence = returns_scaled[-seq_len:].flatten().tolist()
+    future_predictions_scaled = []
+
     for _ in range(forecast_days):
-        inp = np.array(last_seq[-seq_len:]).reshape(1, seq_len, 1)
-        p = float(model.predict(inp, verbose=0)[0, 0])
-        preds.append(p)
-        last_seq.append(p)
-    pred_returns = scaler.inverse_transform(np.array(preds).reshape(-1, 1)).flatten()
+        input_seq = np.array(last_sequence[-seq_len:]).reshape(1, seq_len, 1)
+        pred = model.predict(input_seq, verbose=0)[0, 0]
+        future_predictions_scaled.append(pred)
+        last_sequence.append(pred)
+
+    future_returns = scaler.inverse_transform(
+        np.array(future_predictions_scaled).reshape(-1, 1)
+    ).flatten()
+
+    last_price = float(portfolio_value.iloc[-1])
+    future_prices = [last_price]
+    for r in future_returns:
+        future_prices.append(future_prices[-1] * (1.0 + r))
+
+    return future_prices, None
+
+def lstm_forecast(prices, weights, forecast_days=60, seed_capital=1_000_000):
+    price_index = (prices * weights[:len(prices.columns)]).sum(axis=1)
+    scale = seed_capital / float(price_index.iloc[0])
+    portfolio_value = price_index * scale
+    last = float(portfolio_value.iloc[-1])
+
+    forecast, error = _build_lstm_model(portfolio_value, forecast_days)
+    if forecast is not None:
+        return {"forecast": [round(v, 2) for v in forecast]}
+
+    print(f"  LSTM failed ({error}), using smoothed projection")
+    seq = _smooth_fallback(portfolio_value, forecast_days)
+    return {"forecast": [round(last, 2)] + seq}
+
+def _smooth_fallback(portfolio_value, forecast_days=60):
     last_val = float(portfolio_value.iloc[-1])
+    returns = portfolio_value.pct_change().dropna()
+    mu = float(returns.mean())
+    sigma = float(returns.std())
+    recent = returns.tail(21)
+    momentum = float(recent.mean())
+    blended_drift = 0.6 * mu + 0.4 * momentum
     future = [last_val]
-    for r in pred_returns:
-        future.append(future[-1] * (1.0 + r))
-    return {"forecast": [round(v, 2) for v in future]}
+    for i in range(forecast_days):
+        decay = np.exp(-i / 45)
+        r = decay * blended_drift + (1 - decay) * mu
+        noise = np.random.normal(0, sigma * 0.15)
+        future.append(future[-1] * (1.0 + r + noise))
+    return [round(v, 2) for v in future]
 
 def stress_scenarios(path_matrix, seed_capital, reddit_info=None):
     scenarios = [
