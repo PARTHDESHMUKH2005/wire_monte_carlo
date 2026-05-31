@@ -6,8 +6,9 @@ import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer,
 } from "recharts";
+import { getApiBaseUrl } from "@/lib/api";
 
-const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const API = getApiBaseUrl();
 
 export default function Dashboard() {
   const router = useRouter();

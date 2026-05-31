@@ -41,8 +41,8 @@ services:
     plan: free
     branch: main
     rootDir: frontend
-    buildCommand: npm install && npm run build
-    startCommand: npm start
+    buildCommand: npm ci && npm run build
+    startCommand: npm start -- -H 0.0.0.0 -p $PORT
     envVars:
       - key: NODE_VERSION
         value: 22
