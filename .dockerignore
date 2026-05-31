@@ -1,0 +1,10 @@
+__pycache__
+*.pyc
+.env
+*.pkl
+*.db
+.risk_cache
+.git
+node_modules
+.next
+.DS_Store
