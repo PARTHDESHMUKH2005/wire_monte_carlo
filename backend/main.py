@@ -1,15 +1,22 @@
 import numpy as np
 import pandas as pd
 import yfinance as yf
-import os, sys, pickle
+import os, sys, pickle, json, sqlite3
 from datetime import datetime, timedelta
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, field_validator
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, field_validator, model_validator
+from dotenv import load_dotenv
+import jwt
+
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CACHE_DIR = os.path.join(PROJECT_ROOT, ".risk_cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
+
+_DATA_IS_SYNTHETIC = False
 
 DEFAULT_ASSETS = {
     "SPY": 0.00078, "QQQ": 0.00100, "AGG": 0.00021, "GLD": 0.00131,
@@ -19,10 +26,37 @@ DEFAULT_ASSETS = {
 }
 DEFAULT_VOL = 0.015
 
-WIRE_API_KEY = os.environ.get("WIRE_API_KEY", "ask_654fad46faed02cec9e79bacf7786be752a6b27c5b1031019b4a0a8948f5b081")
+WIRE_API_KEY = os.environ.get("WIRE_API_KEY", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+
+SHARED_PASSWORD = "riskmaster2024"
+JWT_SECRET = os.environ.get("JWT_SECRET", "liverisk-jwt-secret-key-2024-abcdef1234567890")
+JWT_ALGORITHM = "HS256"
+
+DB_PATH = os.path.join(PROJECT_ROOT, "liverisk.db")
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_name TEXT NOT NULL,
+            tickers TEXT NOT NULL,
+            weights TEXT NOT NULL,
+            result TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
 
 app = FastAPI(title="LiveRisk API", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+security = HTTPBearer(auto_error=False)
 
 class AnalyzeRequest(BaseModel):
     tickers: list[str]
@@ -42,18 +76,47 @@ class AnalyzeRequest(BaseModel):
             raise ValueError("Weights must sum to 1.0")
         return v
 
-def wire_call(action_id: str, params: dict):
+    @model_validator(mode="after")
+    def lengths_match(self):
+        if len(self.tickers) != len(self.weights):
+            raise ValueError(f"Tickers ({len(self.tickers)}) and weights ({len(self.weights)}) must have the same length")
+        return self
+
+class LoginRequest(BaseModel):
+    name: str
+    password: str
+
+def create_token(name: str) -> str:
+    payload = {
+        "sub": name,
+        "iat": datetime.utcnow(),
+        "exp": datetime.utcnow() + timedelta(days=7),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def verify_token(token: str):
     try:
-        from anakin import Anakin
-        client = Anakin(api_key=WIRE_API_KEY)
-        result = client.wire(action_id, params)
-        return result.model_dump() if hasattr(result, "model_dump") else result
-    except Exception as e:
-        print(f"  Wire '{action_id}' failed: {e}")
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return payload["sub"]
+    except jwt.PyJWTError:
         return None
 
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="Missing authorization header")
+    name = verify_token(credentials.credentials)
+    if name is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    return name
+
+@app.post("/login")
+def login(req: LoginRequest):
+    if req.password != SHARED_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid password")
+    token = create_token(req.name)
+    return {"token": token, "name": req.name, "password_hint": SHARED_PASSWORD}
+
 def _synthetic_prices(tickers, years=2):
-    """Generate synthetic price data when yfinance is unavailable."""
     rng = np.random.default_rng(42)
     n = max(len(tickers), 1)
     n_days = int(years * 252)
@@ -75,6 +138,7 @@ def _synthetic_prices(tickers, years=2):
     return prices
 
 def fetch_prices(tickers, years=2):
+    global _DATA_IS_SYNTHETIC
     end = datetime.today()
     start = end - timedelta(days=int(years * 365))
     try:
@@ -88,10 +152,12 @@ def fetch_prices(tickers, years=2):
         prices = prices.dropna(axis=1, how="all")
         if prices.empty or prices.shape[1] == 0:
             raise ValueError("No valid price columns after cleaning")
+        _DATA_IS_SYNTHETIC = False
         print(f"  yfinance: fetched {prices.shape[1]} tickers, {prices.shape[0]} days")
         return prices
     except Exception as e:
         print(f"  yfinance failed ({e}), falling back to synthetic data")
+        _DATA_IS_SYNTHETIC = True
         return _synthetic_prices(tickers, years)
 
 def compute_returns(prices):
@@ -136,18 +202,31 @@ def risk_metrics(terminal, seed_capital, confidence=0.95):
 
 def sentiment_analysis(tickers):
     headlines = []
-    for t in tickers:
-        result = wire_call("reuters", {"ticker": t, "action": "headlines"})
-        if result and "headlines" in result:
-            headlines.extend(result["headlines"])
-    if not headlines:
+
+    try:
         from anakin import Anakin
         client = Anakin(api_key=WIRE_API_KEY)
-        search = client.search(f"latest news for {' '.join(tickers)} stock market 2026")
+        search = client.search(f"latest news for {' '.join(tickers)} stock market 2026", limit=10)
         if search.results:
-            for r in search.results[:10]:
+            for r in search.results:
                 if r.snippet:
-                    headlines.append({"title": r.title, "snippet": r.snippet})
+                    headlines.append({"title": r.title or "", "snippet": r.snippet})
+    except Exception:
+        pass
+
+    if not headlines:
+        for t in tickers:
+            try:
+                tk = yf.Ticker(t)
+                news = tk.news or []
+                for item in news[:5]:
+                    headlines.append({
+                        "title": item.get("title", ""),
+                        "snippet": item.get("summary", "")
+                    })
+            except Exception:
+                pass
+
     if not headlines:
         return {"score": 0.0, "headlines": [], "summary": "No news data available"}
 
@@ -182,16 +261,14 @@ def sentiment_analysis(tickers):
 
 def reddit_hype(tickers):
     mentions = {}
-    for t in tickers:
-        result = wire_call("reddit", {"ticker": t, "subreddit": "wallstreetbets", "action": "mentions"})
-        if result and "mentions" in result:
-            mentions[t] = result["mentions"]
-    if not mentions:
+    try:
         from anakin import Anakin
         client = Anakin(api_key=WIRE_API_KEY)
-        search = client.search(f"wallstreetbets {' '.join(tickers)} stock mention count May 2026")
+        search = client.search(f"wallstreetbets {' '.join(tickers)} stock mention count May 2026", limit=5)
         if search.results:
             mentions = {t: 5 for t in tickers}
+    except Exception:
+        pass
     spike = any(v > 10 for v in mentions.values()) if mentions else False
     return {"mentions": mentions, "spike_detected": spike}
 
@@ -295,8 +372,118 @@ def stress_scenarios(path_matrix, seed_capital, reddit_info=None):
         })
     return results
 
+CRISIS_PERIODS = [
+    {"name": "COVID Crash (2020)", "start": "2020-02-19", "end": "2020-03-23",
+     "desc": "Pandemic selloff — fastest bear market in history, VIX hit 82"},
+    {"name": "2022 Rate Hike Selloff", "start": "2022-01-03", "end": "2022-10-12",
+     "desc": "Fed hiking cycle — growth stocks crushed, bond yields surged"},
+    {"name": "2018 Q4 Meltdown", "start": "2018-10-01", "end": "2018-12-24",
+     "desc": "Trade war fears + Fed tightening — S&P 500 fell ~20% in 3 months"},
+    {"name": "2023 Banking Crisis", "start": "2023-03-08", "end": "2023-03-23",
+     "desc": "SVB/CS collapse — regional bank stocks hammered, system stress"},
+]
+
+def compute_max_drawdown(series):
+    peak = np.maximum.accumulate(series)
+    dd = (series - peak) / peak
+    return float(np.min(dd))
+
+def backtest_portfolio(tickers, weights, seed_capital=1_000_000):
+    weights = np.array(weights, dtype=float)
+    weights = weights / weights.sum()
+    prices = fetch_prices(tickers, years=12)
+    if prices.empty or prices.shape[1] == 0:
+        return {"error": "No price data available for backtest", "crises": [], "accuracy": None}
+
+    aligned = prices[tickers] if all(t in prices.columns for t in tickers) else prices
+    port_val = (aligned * weights[:len(aligned.columns)]).sum(axis=1)
+    scale = seed_capital / float(port_val.iloc[0])
+    port_val = port_val * scale
+
+    results = []
+    for crisis in CRISIS_PERIODS:
+        crisis_start = pd.Timestamp(crisis["start"])
+        crisis_end = pd.Timestamp(crisis["end"])
+        mask = (port_val.index >= crisis_start) & (port_val.index <= crisis_end)
+        crisis_data = port_val[mask]
+        if len(crisis_data) < 5:
+            continue
+
+        pre_mask = port_val.index < crisis_start
+        pre_data = port_val[pre_mask]
+        if len(pre_data) < 60:
+            continue
+
+        actual_return = float((crisis_data.iloc[-1] - crisis_data.iloc[0]) / crisis_data.iloc[0])
+        max_dd = compute_max_drawdown(crisis_data.values)
+        actual_var_pct = abs(max_dd)
+        actual_var_dollar = actual_var_pct * seed_capital
+
+        pre_returns = pre_data.pct_change().dropna().to_numpy(dtype=float)
+        if len(pre_returns) < 10:
+            continue
+        crisis_days = max(len(crisis_data), 21)
+        daily_var = abs(float(np.percentile(pre_returns, 5)))
+        var_over_horizon = daily_var * np.sqrt(crisis_days)
+        pre_var_pct = min(1.0, var_over_horizon)
+        predicted_var = round(pre_var_pct * seed_capital, 2)
+        pre_var_pct_display = round(pre_var_pct * 100, 2)
+
+        error_pct = abs(actual_var_dollar - predicted_var) / max(actual_var_dollar, 1)
+        within_20pct = error_pct <= 0.20
+        within_50pct = error_pct <= 0.50
+
+        results.append({
+            "crisis": crisis["name"],
+            "desc": crisis["desc"],
+            "start": crisis["start"],
+            "end": crisis["end"],
+            "actual_return_pct": round(actual_return * 100, 2),
+            "actual_max_drawdown_pct": round(max_dd * 100, 2),
+            "actual_var_dollar": round(actual_var_dollar, 2),
+            "predicted_var": predicted_var,
+            "predicted_var_pct": pre_var_pct_display,
+            "error_pct": round(error_pct * 100, 2),
+            "within_20pct": bool(within_20pct),
+            "within_50pct": bool(within_50pct),
+        })
+
+    if not results:
+        return {"error": "Insufficient historical data for backtest", "crises": [], "accuracy": None}
+
+    total = len(results)
+    within20 = sum(1 for r in results if r["within_20pct"])
+    within50 = sum(1 for r in results if r["within_50pct"])
+    avg_error = float(np.mean([r["error_pct"] for r in results]))
+
+    if avg_error < 20:
+        grade = "A"
+        verdict = "Model predicts actual crisis losses with high accuracy. You can trust the VaR numbers."
+    elif avg_error < 40:
+        grade = "B"
+        verdict = "Model is directionally correct but may underestimate tail risk in severe downturns."
+    elif avg_error < 60:
+        grade = "C"
+        verdict = "Model captures general risk direction but has meaningful error. Use VaR as a guide, not gospel."
+    else:
+        grade = "D"
+        verdict = "Model shows low correlation with actual crisis losses. Consider diversification or hedging."
+
+    accuracy = {
+        "grade": grade,
+        "verdict": verdict,
+        "crises_tested": total,
+        "avg_error_pct": round(avg_error, 2),
+        "within_20pct": within20,
+        "within_50pct": within50,
+        "within_20pct_pct": round(within20 / total * 100, 1),
+        "within_50pct_pct": round(within50 / total * 100, 1),
+    }
+    return {"crises": results, "accuracy": accuracy, "using_synthetic_data": _DATA_IS_SYNTHETIC}
+
+
 @app.post("/analyze")
-def analyze(req: AnalyzeRequest):
+def analyze(req: AnalyzeRequest, user: str = Depends(get_current_user)):
     tickers = req.tickers
     weights = np.array(req.weights, dtype=float)
     weights = weights / weights.sum()
@@ -316,7 +503,7 @@ def analyze(req: AnalyzeRequest):
     forec = lstm_forecast(prices, weights)
     stress = stress_scenarios(paths, 1_000_000, reddit)
 
-    return {
+    result = {
         "var": metrics["var"],
         "cvar": metrics["cvar"],
         "sentiment_adjusted_var": vol_adjusted_var,
@@ -329,6 +516,107 @@ def analyze(req: AnalyzeRequest):
         "reddit_hype": reddit,
         "config": {"tickers": tickers, "weights": [round(float(w), 4) for w in weights]},
     }
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO history (user_name, tickers, weights, result) VALUES (?, ?, ?, ?)",
+        (user, json.dumps(tickers), json.dumps([round(float(w), 4) for w in weights]), json.dumps(result))
+    )
+    conn.commit()
+    conn.close()
+
+    return result
+
+class SummaryRequest(BaseModel):
+    tickers: list[str]
+    weights: list[float]
+    var: float
+    cvar: float
+    sentiment_score: float
+    prob_loss: float
+    forecast_60d: list[float]
+    stress_scenarios: list[dict] = []
+    backtest_grade: str = ""
+    backtest_verdict: str = ""
+
+def groq_summary(data: dict) -> str:
+    if not GROQ_API_KEY:
+        return ""
+    try:
+        from groq import Groq
+        client = Groq(api_key=GROQ_API_KEY)
+        tickers = ", ".join(data.get("tickers", []))
+        weights = ", ".join(f"{w*100:.0f}%" for w in data.get("weights", []))
+        var = data.get("var", 0)
+        cvar = data.get("cvar", 0)
+        sentiment = data.get("sentiment_score", 0)
+        prob_loss = data.get("prob_loss", 0)
+        forecast_start = data.get("forecast_60d", [0])[0] if data.get("forecast_60d") else 0
+        forecast_end = data.get("forecast_60d", [0])[-1] if data.get("forecast_60d") else 0
+        scenarios = data.get("stress_scenarios", [])
+        worst_scenario = max(scenarios, key=lambda s: s.get("var_95", 0)) if scenarios else None
+        grade = data.get("backtest_grade", "")
+        verdict = data.get("backtest_verdict", "")
+
+        prompt = f"""You are a financial risk analyst explaining portfolio risk to a retail investor. Use plain English. No jargon without defining it. Keep it to 3-4 sentences. The user is looking at a dashboard — tell them what matters.
+
+Portfolio: {tickers} with weights {weights}
+95% VaR (Value at Risk): ${var:,.0f} — this means there's a 5% chance of losing more than this in a year
+95% CVaR (average loss in worst 5%): ${cvar:,.0f}
+FinBERT news sentiment: {sentiment:.2f} (positive = bullish, negative = bearish)
+Probability of any loss: {prob_loss*100:.1f}%
+60-day LSTM forecast: ${forecast_start:,.0f} → ${forecast_end:,.0f}
+Risk grade (backtest vs history): {grade} — {verdict}"""
+
+        if worst_scenario:
+            name = worst_scenario.get("scenario") or worst_scenario.get("name", "Unknown")
+            loss = worst_scenario.get("var_95", 0)
+            prompt += f"\nWorst stress scenario: {name} — estimated loss ${loss:,.0f}"
+
+        completion = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=200,
+            temperature=0.4,
+        )
+        return completion.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"  Groq summary failed: {e}")
+        return ""
+
+@app.post("/summary")
+def summary(req: SummaryRequest):
+    text = groq_summary(req.model_dump())
+    return {"summary": text}
+
+@app.post("/backtest")
+def backtest(req: AnalyzeRequest, user: str = Depends(get_current_user)):
+    tickers = req.tickers
+    weights = np.array(req.weights, dtype=float)
+    weights = weights / weights.sum()
+    return backtest_portfolio(tickers, weights)
+
+@app.get("/history")
+def get_history(user: str = Depends(get_current_user)):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT id, tickers, weights, result, created_at FROM history WHERE user_name = ? ORDER BY created_at DESC",
+        (user,)
+    )
+    rows = c.fetchall()
+    conn.close()
+    return [
+        {
+            "id": r[0],
+            "tickers": json.loads(r[1]),
+            "weights": json.loads(r[2]),
+            "result": json.loads(r[3]),
+            "created_at": r[4],
+        }
+        for r in rows
+    ]
 
 @app.get("/health")
 def health():
