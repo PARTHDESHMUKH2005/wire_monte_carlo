@@ -23,8 +23,10 @@ if load_dotenv is not None:
     load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CACHE_DIR = os.path.join(PROJECT_ROOT, ".risk_cache")
+DATA_DIR = os.environ.get("DATA_DIR", os.path.join(PROJECT_ROOT, ".risk_cache"))
+CACHE_DIR = os.path.join(DATA_DIR, ".risk_cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
 
 _DATA_IS_SYNTHETIC = False
 
@@ -43,7 +45,7 @@ SHARED_PASSWORD = "riskmaster2024"
 JWT_SECRET = os.environ.get("JWT_SECRET", "liverisk-jwt-secret-key-2024-abcdef1234567890")
 JWT_ALGORITHM = "HS256"
 
-DB_PATH = os.path.join(PROJECT_ROOT, "liverisk.db")
+DB_PATH = os.path.join(DATA_DIR, "liverisk.db")
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -68,8 +70,10 @@ _sentiment_pipeline_loaded = False
 _wire_client = None
 _lstm_cache = {}
 
+CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*").split(",")
+
 app = FastAPI(title="LiveRisk API", version="1.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_methods=["*"], allow_headers=["*"])
 
 security = HTTPBearer(auto_error=False)
 
@@ -243,17 +247,26 @@ def risk_metrics(terminal, seed_capital, confidence=0.95):
     prob_loss = float(np.mean(terminal < seed_capital))
     return {"var": round(var, 2), "cvar": round(cvar, 2), "prob_loss": round(prob_loss, 4)}
 
-def sentiment_analysis(tickers):
-    headlines = []
+def _wire_news(tickers):
+    client = _get_wire_client()
+    if not client:
+        return None
+    try:
+        search = client.search(f"latest financial news for {' '.join(tickers)} stock market", limit=10)
+        headlines = []
+        if search and search.results:
+            for r in search.results:
+                if r.title or r.snippet:
+                    headlines.append({"title": r.title or "", "snippet": r.snippet or ""})
+        if headlines:
+            print(f"  Wire search: {len(headlines)} news items for {tickers}")
+        return headlines or None
+    except Exception as e:
+        print(f"  Wire search failed: {e}")
+        return None
 
-    for t in tickers:
-        data = wire_call("reuters", {"ticker": t, "action": "headlines", "limit": 10})
-        if data and 'headlines' in data:
-            for h in data['headlines']:
-                title = h.get('title', h.get('headline', ''))
-                snippet = h.get('snippet', h.get('summary', h.get('text', '')))
-                headlines.append({"title": title, "snippet": snippet})
-            print(f"  Wire reuters: {len(data['headlines'])} headlines for {t}")
+def sentiment_analysis(tickers):
+    headlines = _wire_news(tickers)
 
     if not headlines:
         for t in tickers:
@@ -267,18 +280,6 @@ def sentiment_analysis(tickers):
                     })
             except Exception:
                 pass
-
-    if not headlines:
-        try:
-            client = _get_wire_client()
-            if client:
-                search = client.search(f"latest financial news for {' '.join(tickers)} stock market", limit=10)
-                if search and search.results:
-                    for r in search.results:
-                        if r.title or r.snippet:
-                            headlines.append({"title": r.title or "", "snippet": r.snippet or ""})
-        except Exception:
-            pass
 
     if not headlines:
         return {"score": 0.0, "headlines": [], "summary": "No news data available"}
@@ -304,7 +305,9 @@ def sentiment_analysis(tickers):
                 else:
                     scores.append(0.0)
             sentiment = round(float(np.mean(scores)), 4) if scores else 0.0
-    except Exception:
+            print(f"  FinBERT sentiment: {sentiment} from {len(scores)} headlines")
+    except Exception as e:
+        print(f"  FinBERT failed: {e}")
         sentiment = 0.0
 
     summary = f"Analyzed {len(headlines)} headlines across {len(tickers)} tickers. "
@@ -319,33 +322,27 @@ def sentiment_analysis(tickers):
 
 def reddit_hype(tickers):
     mentions = {}
-    for t in tickers:
-        data = wire_call("reddit", {
-            "ticker": t,
-            "subreddit": "wallstreetbets",
-            "action": "mentions",
-            "time_filter": "week",
-            "limit": 25,
-        })
-        if data:
-            posts = data.get('posts', data.get('mentions', []))
-            if isinstance(posts, list):
-                mentions[t] = len(posts)
-            else:
-                count = data.get('mention_count', data.get('count', data.get('total_mentions', 0)))
-                mentions[t] = count if isinstance(count, (int, float)) else 0
-            print(f"  Wire reddit: {mentions[t]} WSB mentions for {t}")
+    client = _get_wire_client()
+    if client:
+        try:
+            search = client.search(f"wallstreetbets {' '.join(tickers)} reddit mentions", limit=10)
+            if search and search.results:
+                for t in tickers:
+                    mentions[t] = len(search.results)
+                print(f"  Wire search: WSB mentions found for {tickers}")
+        except Exception as e:
+            print(f"  Wire WSB search failed: {e}")
 
     if not mentions:
-        try:
-            client = _get_wire_client()
-            if client:
-                search = client.search(f"wallstreetbets {' '.join(tickers)} reddit mentions", limit=5)
-                if search and search.results:
-                    for t in tickers:
-                        mentions[t] = 3
-        except Exception:
-            pass
+        for t in tickers:
+            try:
+                tk = yf.Ticker(t)
+                news = tk.news or []
+                count = len(news)
+                if count > 0:
+                    mentions[t] = count
+            except Exception:
+                pass
 
     spike = any(v > 10 for v in mentions.values()) if mentions else False
     return {"mentions": mentions, "spike_detected": spike}

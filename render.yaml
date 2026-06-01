@@ -1,0 +1,32 @@
+services:
+
+  - type: web
+    name: liverisk-backend
+    env: docker
+    dockerfilePath: ./backend/Dockerfile
+    plan: starter
+    memory: 2GB
+    disk:
+      name: liverisk-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: JWT_SECRET
+        generateValue: true
+      - key: WIRE_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: DATA_DIR
+        value: /data
+      - key: CORS_ORIGINS
+        value: https://liverisk-frontend.onrender.com
+
+  - type: web
+    name: liverisk-frontend
+    env: docker
+    dockerfilePath: ./frontend/Dockerfile
+    plan: free
+    envVars:
+      - key: NEXT_PUBLIC_API_URL
+        value: https://liverisk-backend.onrender.com

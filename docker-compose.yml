@@ -3,22 +3,29 @@ services:
   backend:
     build: ./backend
     ports:
-      - "8000:8000"
+      - "${BACKEND_PORT:-8000}:8000"
     env_file:
       - .env
     environment:
-      - JWT_SECRET=${JWT_SECRET:-liverisk-jwt-secret-key-2024-abcdef1234567890}
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET is required}
+      - DATA_DIR=/data
     volumes:
-      - ./backend:/app
-      - backend_data:/app/.risk_cache
+      - backend_data:/data
     restart: unless-stopped
+    healthcheck:
+      test: python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
 
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      args:
+        - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000}
     ports:
-      - "3000:3000"
-    environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - "${FRONTEND_PORT:-3000}:3000"
     depends_on:
       - backend
     restart: unless-stopped
