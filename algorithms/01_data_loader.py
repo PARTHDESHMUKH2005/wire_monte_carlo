@@ -9,7 +9,7 @@ import os
 warnings.filterwarnings('ignore')
 
 # Wire API config
-WIRE_API_KEY = os.environ.get("WIRE_API_KEY", "ask_654fad46faed02cec9e79bacf7786be752a6b27c5b1031019b4a0a8948f5b081")
+WIRE_API_KEY = os.environ.get("WIRE_API_KEY", "ask.........81")
 
 from anakin import Anakin
 wire = Anakin(api_key=WIRE_API_KEY)
