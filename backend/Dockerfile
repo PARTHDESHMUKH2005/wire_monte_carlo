@@ -15,7 +15,9 @@ RUN pip install --no-cache-dir --prefer-binary --default-timeout=600 \
     fastapi==0.115.0 PyJWT==2.9.0 uvicorn==0.30.0 python-dotenv==1.0.1 \
     yfinance==0.2.44 joblib==1.4.2 scikit-learn==1.5.1 \
     pydantic==2.8.2 seaborn==0.13.2 matplotlib==3.9.2 \
-    groq==0.37.1 anakin-sdk==0.1.0
+    groq==0.37.1 anakin-sdk==0.1.0 psycopg2-binary==2.9.9 \
+    sendgrid==6.11.0 sqlalchemy==2.0.35 \
+    langgraph==0.2.67 langchain-core==0.3.33
 
 # Install large ML packages with robust retry mechanism
 RUN pip install --no-cache-dir --prefer-binary --default-timeout=900 --retries=5 \

@@ -1,0 +1,20 @@
+# Vera AI Agent dependencies — install AFTER requirements.txt
+# These have loose version constraints to avoid pip resolution conflicts
+
+litellm
+langfuse
+celery
+redis
+twilio
+sendgrid
+weasyprint
+python-jose
+passlib
+sqlalchemy
+alembic
+python-multipart
+httpx
+apscheduler
+
+# LangGraph and LangChain — install separately if LangGraph mode is desired
+# pip install langgraph langchain-core

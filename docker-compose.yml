@@ -1,5 +1,22 @@
 services:
 
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: liverisk
+      POSTGRES_PASSWORD: liverisk
+      POSTGRES_DB: liverisk
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U liverisk"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
   backend:
     build: ./backend
     ports:
@@ -7,28 +24,44 @@ services:
     env_file:
       - .env
     environment:
-      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET is required}
+      - JWT_SECRET=${JWT_SECRET:-liverisk-jwt-secret-2024-change-in-production}
       - DATA_DIR=/data
+      - CORS_ORIGINS=${CORS_ORIGINS:-*}
+      - DATABASE_URL=${DATABASE_URL:-postgresql://liverisk:liverisk@db:5432/liverisk}
+      - SENDGRID_API_KEY=${SENDGRID_API_KEY:-}
+      - EMAIL_FROM=${EMAIL_FROM:-vera@liverisk.app}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - WIRE_API_KEY=${WIRE_API_KEY:-}
+      - FINNHUB_API_KEY=${FINNHUB_API_KEY:-}
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
     volumes:
       - backend_data:/data
+    depends_on:
+      db:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 60s
+      start_period: 120s
 
   frontend:
     build:
       context: ./frontend
       args:
         - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+        - NEXT_PUBLIC_BACKEND_URL=${NEXT_PUBLIC_BACKEND_URL:-}
     ports:
       - "${FRONTEND_PORT:-3000}:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+      - NEXT_PUBLIC_BACKEND_URL=${NEXT_PUBLIC_BACKEND_URL:-}
     depends_on:
       - backend
     restart: unless-stopped
 
 volumes:
+  pgdata:
   backend_data:

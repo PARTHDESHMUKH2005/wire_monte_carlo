@@ -1,3 +1,9 @@
+databases:
+  - name: liverisk-db
+    plan: free
+    databaseName: liverisk
+    user: liverisk
+
 services:
 
   - type: web

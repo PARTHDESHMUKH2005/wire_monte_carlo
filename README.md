@@ -71,6 +71,7 @@ Without Wire, this would require maintaining separate scrapers for each source �
 ```bash
 cd backend
 pip install -r requirements.txt
+pip install -r requirements-agent.txt
 uvicorn main:app --reload --port 8000
 ```
 
@@ -93,6 +94,119 @@ Create these actions in your [Wire dashboard](https://anakin.io/wire) for the AP
 
 The pipeline works without them using search fallbacks.
 
+## Vera AI Agent Setup
+
+Vera is a conversational AI portfolio risk analyst powered by LangGraph, LiteLLM, and Celery. It adds natural-language interaction, institutional reports, morning briefs, and threshold alerts to LiveRisk.
+
+### Architecture
+
+```mermaid
+flowchart LR
+    A[User Chat] --> B[Vera Chat UI]
+    B --> C[/api/agent/chat]
+    C --> D[LangGraph Agent]
+    D --> E[Intent Classifier<br/>gemini-1.5-flash]
+    D --> F[Quant Engine<br/>Monte Carlo / VaR / Sentiment]
+    D --> G[Forecast Node<br/>claude-sonnet-4-6]
+    D --> H[Report Assembler<br/>GPT-4o]
+    D --> I[Response Writer<br/>streaming tokens]
+    D --> J[Langfuse Tracing]
+    D --> K[Memory / Postgres]
+    C --> L[StreamingResponse<br/>Server-Sent Events]
+    M[Celery Beat] --> N[Morning Brief 6:30AM]
+    M --> O[Alert Monitor 15min]
+    N --> P[Twilio WhatsApp]
+    N --> Q[SendGrid Email]
+```
+
+### 1. Install dependencies (two-step to avoid pip resolution conflicts)
+
+```bash
+cd backend
+pip install -r requirements.txt
+pip install -r requirements-agent.txt
+```
+
+**Note:** WeasyPrint requires system libraries. On macOS:
+```bash
+brew install pango libffi
+```
+On Ubuntu/Debian:
+```bash
+sudo apt-get install -y libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf2.0-0 libffi-dev libcairo2
+```
+
+### 2. Configure environment
+
+```bash
+cp .env.example .env
+```
+
+Fill in these keys (all optional — Vera degrades gracefully if missing):
+- `OPENAI_API_KEY` — GPT-4o for report generation and reasoning
+- `ANTHROPIC_API_KEY` — Claude Sonnet for 60-day scenario forecasts
+- `GEMINI_API_KEY` — Gemini Flash for intent classification and sentiment
+- `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` — LLM tracing (free tier available)
+- `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` — WhatsApp morning briefs
+- `SENDGRID_API_KEY` — Email morning briefs with PDF attachment
+- `REDIS_URL` — Redis for Celery task queue (default: `redis://localhost:6379/0`)
+
+### 3. Start Redis (required for Celery)
+
+```bash
+docker run -d -p 6379:6379 redis:alpine
+```
+
+### 4. Start Celery worker
+
+```bash
+celery -A backend.tasks.celery_app worker --loglevel=info
+```
+
+### 5. Start Celery beat scheduler
+
+```bash
+celery -A backend.tasks.celery_app beat --loglevel=info
+```
+
+### 6. Start FastAPI
+
+```bash
+cd backend
+uvicorn main:app --reload --port 8000
+```
+
+### 7. Access Vera
+
+Navigate to **http://localhost:3000/vera** in the frontend.
+
+Login first, then click the "Vera AI" tab in the navigation bar.
+
+### Key Features
+
+| Feature | How to Use | Technical Detail |
+|---|---|---|
+| **Conversational Chat** | Type any question about your portfolio | LangGraph agent with 8 nodes, streaming SSE |
+| **60-Day Scenario Analysis** | Click "60-Day Outlook" or ask "what's my forecast" | Claude Sonnet generates bull/base/bear with probabilities |
+| **Institutional Risk Report** | Click "Report" tab or ask "generate a report" | GPT-4o assembles full markdown → downloadable PDF |
+| **Morning Briefs** | Enable in "Morning Brief" tab | Celery beat sends WhatsApp + email at 6:30 AM daily |
+| **Threshold Alerts** | Configure in "Alerts" tab | Celery checks VaR/health/volatility every 15min |
+| **Accountability Tracking** | Auto-generated in Morning Brief tab | Tracks recommendation accuracy vs actual market |
+| **LLM Cost Tracking** | Automatic | Langfuse traces every LLM call with token counts |
+| **Model Fallbacks** | Automatic | GPT-4o → Claude Sonnet → Gemini Flash on failure |
+
+### Graceful Degradation
+
+Vera is designed to work without any external dependencies:
+
+- **No LLM keys**: Falls back to rule-based quant interpretation
+- **No Redis**: Celery tasks skip silently, scheduling disabled
+- **No Twilio/SendGrid**: Briefs log to database instead of sending
+- **No PostgreSQL**: Falls back to SQLite (`liverisk.db`)
+- **WeasyPrint not installed**: PDF download falls back to raw markdown
+
+The core quant engine (Monte Carlo, VaR, sentiment) always works regardless of Vera configuration.
+
 ## Project Structure
 ```
 LiveRisk/
@@ -110,5 +224,31 @@ LiveRisk/
 ├── 04_risk_metrics.ipynb     # VaR/CVaR + FinBERT sentiment
 ├── 05_stress_test.ipynb      # Stress scenarios + WSB detection
 ├── 06_ml_forecast_insights.ipynb # LSTM forecast
+├── backend/
+│   ├── agent/                   # Vera AI agent
+│   │   ├── state.py            # RiskAgentState TypedDict
+│   │   ├── vera.py             # LangGraph multi-node agent
+│   │   ├── memory.py           # Conversation & risk run persistence
+│   │   ├── langfuse_config.py  # LLM tracing & cost tracking
+│   │   ├── litellm_config.py   # Multi-model routing with fallbacks
+│   │   ├── pdf_generator.py    # weasyprint markdown→PDF
+│   │   └── accountability.py   # Tracks recommendation accuracy
+│   ├── tasks/                   # Celery scheduled tasks
+│   │   ├── celery_app.py       # Redis broker + beat schedule
+│   │   ├── morning_brief.py    # 6:30 AM WhatsApp + email briefs
+│   │   └── alert_monitor.py    # Threshold-based risk alerts
+│   ├── database/                # SQLAlchemy models
+│   │   ├── connection.py       # Engine + session factory
+│   │   └── models.py           # User, Portfolio, Conversation, etc.
+│   └── routes/
+│       └── agent.py            # /api/agent/chat, /report, /alerts, etc.
+├── frontend/src/
+│   ├── components/agent/        # Vera frontend components
+│   │   ├── VeraChat.tsx        # Conversational chat interface
+│   │   ├── VeraReport.tsx      # Full report viewer with PDF download
+│   │   ├── MorningBrief.tsx    # Brief subscription & timeline
+│   │   └── AlertConfig.tsx     # Alert threshold sliders
+│   └── app/vera/
+│       └── page.js             # Vera tab with sub-tabs
 └── README.md
 ```
